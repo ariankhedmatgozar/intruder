@@ -1,241 +1,350 @@
 import argparse
 import hashlib
-import sys
+import time
+
 import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 
 class MiniIntruder:
-
-    def __init__(self, url, method="GET", wordlist=None,
-                 parameter="username", headers=None,
-                 cookies=None, verbose=False):
-
+    def __init__(
+        self,
+        url,
+        wordlist,
+        fixed_value,
+        target,
+        retries=3,
+        retry_delay=1
+    ):
         self.url = url
-        self.method = method.upper()
         self.wordlist = wordlist
-        self.parameter = parameter
-        self.headers = headers or {}
-        self.cookies = cookies or {}
-        self.verbose = verbose
+        self.fixed_value = fixed_value
+        self.target = target
+
+        self.retries = retries
+        self.retry_delay = retry_delay
+
+        self.session = requests.Session()
+
+        self.form_action = None
+        self.form_method = None
+
+        self.username_field = None
+        self.password_field = None
+
+        self.hidden_fields = {}
 
         self.baseline = None
 
-    def fingerprint(self, response):
-        """
-        یک fingerprint ساده از Response می‌سازد.
-        """
+    def load_login_page(self):
+        response = self.session.get(
+            self.url,
+            timeout=10
+        )
 
-        body = response.text
+        response.raise_for_status()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        form = soup.find(
+            "form",
+            class_="login-form"
+        )
+
+        if not form:
+            raise RuntimeError(
+                "Login form not found"
+            )
+
+        self.form_method = form.get(
+            "method",
+            "GET"
+        ).upper()
+
+        self.form_action = urljoin(
+            response.url,
+            form.get("action", "")
+        )
+
+        inputs = form.find_all("input")
+
+        for field in inputs:
+            name = field.get("name")
+
+            if not name:
+                continue
+
+            field_type = field.get(
+                "type",
+                "text"
+            ).lower()
+
+            if field_type == "password":
+                self.password_field = name
+
+            elif field_type in (
+                "text",
+                "username",
+                "email"
+            ):
+                self.username_field = name
+
+            elif field_type == "hidden":
+                self.hidden_fields[name] = field.get(
+                    "value",
+                    ""
+                )
+
+        if not self.username_field:
+            raise RuntimeError(
+                "Username input not found"
+            )
+
+        if not self.password_field:
+            raise RuntimeError(
+                "Password input not found"
+            )
+
+    def create_fingerprint(self, response):
+        body = response.content
 
         return {
             "status": response.status_code,
-            "length": len(response.content),
-            "hash": hashlib.sha256(
-                body.encode(errors="ignore")
-            ).hexdigest()
+            "length": len(body),
+            "hash": hashlib.sha256(body).hexdigest()
         }
 
-    def is_different(self, fingerprint):
-        if self.baseline is None:
-            return False
+    def build_data(self, value):
+        data = dict(self.hidden_fields)
 
-        return (
-            fingerprint["status"] != self.baseline["status"]
-            or fingerprint["length"] != self.baseline["length"]
-            or fingerprint["hash"] != self.baseline["hash"]
+        if self.target == "username":
+            data[self.username_field] = value
+            data[self.password_field] = self.fixed_value
+
+        elif self.target == "password":
+            data[self.username_field] = self.fixed_value
+            data[self.password_field] = value
+
+        return data
+
+    def send_request(self, value):
+        data = self.build_data(value)
+
+        if self.form_method == "POST":
+            return self.session.post(
+                self.form_action,
+                data=data,
+                timeout=10,
+                allow_redirects=True
+            )
+
+        return self.session.get(
+            self.form_action,
+            params=data,
+            timeout=10,
+            allow_redirects=True
         )
 
-    def send_request(self, payload):
+    def send_with_retry(self, value):
+        attempt = 0
 
-        if self.method == "GET":
+        while attempt <= self.retries:
+            try:
+                return self.send_request(value)
 
-            params = {
-                self.parameter: payload
-            }
+            except (
+                requests.ConnectionError,
+                requests.Timeout,
+                requests.exceptions.ChunkedEncodingError
+            ) as error:
 
-            return requests.get(
-                self.url,
-                params=params,
-                headers=self.headers,
-                cookies=self.cookies,
-                timeout=10
-            )
+                attempt += 1
 
-        elif self.method == "POST":
+                if attempt > self.retries:
+                    print(
+                        f"[!] Request failed permanently: "
+                        f"{value}"
+                    )
+                    print(
+                        f"[!] Error: {error}"
+                    )
+                    return None
 
-            data = {
-                self.parameter: payload
-            }
+                print(
+                    f"[!] Request failed for "
+                    f"'{value}'"
+                )
 
-            return requests.post(
-                self.url,
-                data=data,
-                headers=self.headers,
-                cookies=self.cookies,
-                timeout=10
-            )
+                print(
+                    f"[+] Retrying "
+                    f"({attempt}/{self.retries})..."
+                )
+
+                time.sleep(self.retry_delay)
+
+        return None
+
+    def analyze_response(
+        self,
+        value,
+        response,
+        request_number
+    ):
+        fingerprint = self.create_fingerprint(
+            response
+        )
+
+        if self.baseline is None:
+            self.baseline = fingerprint
+            result = "BASELINE"
+            different = False
 
         else:
-            raise ValueError(
-                f"Unsupported method: {self.method}"
+            different = (
+                fingerprint["status"]
+                != self.baseline["status"]
+                or fingerprint["length"]
+                != self.baseline["length"]
+                or fingerprint["hash"]
+                != self.baseline["hash"]
             )
 
-    def print_request_info(self, number, payload):
+            result = (
+                "DIFFERENT"
+                if different
+                else "same"
+            )
 
         print()
         print("=" * 70)
-        print(f"[REQUEST #{number}]")
-        print(f"Payload : {payload}")
-        print(f"Method  : {self.method}")
-        print(f"URL     : {self.url}")
-        print("=" * 70)
+        print(f"Request #      : {request_number}")
+        print(f"Target         : {self.target}")
+        print(f"Payload        : {value}")
+        print(f"Status Code    : {fingerprint['status']}")
+        print(f"Content Length : {fingerprint['length']}")
+        print(f"Result         : {result}")
 
-    def print_response(self, response, fingerprint, different):
-
-        print(f"Status Code   : {response.status_code}")
-        print(f"Content Length: {fingerprint['length']}")
-        print(f"SHA256        : {fingerprint['hash']}")
-
-        if self.baseline is None:
-            print("Baseline      : CREATED")
-        elif different:
-            print("Result        : !!! DIFFERENT RESPONSE !!!")
-        else:
-            print("Result        : same as baseline")
-
-        if self.verbose:
-
+        if different:
             print()
-            print("--- RESPONSE HEADERS ---")
-
-            for key, value in response.headers.items():
-                print(f"{key}: {value}")
-
-            print()
-            print("--- RESPONSE BODY ---")
+            print("--- RESPONSE ---")
             print(response.text)
             print("--- END RESPONSE ---")
 
+    def load_wordlist(self):
+        with open(
+            self.wordlist,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            return [
+                line.strip()
+                for line in file
+                if line.strip()
+            ]
+
     def run(self):
+        self.load_login_page()
 
-        try:
-            with open(
-                self.wordlist,
-                "r",
-                encoding="utf-8"
-            ) as file:
-
-                payloads = [
-                    line.strip()
-                    for line in file
-                    if line.strip()
-                ]
-
-        except FileNotFoundError:
-            print("Wordlist not found.")
-            sys.exit(1)
+        payloads = self.load_wordlist()
 
         print()
         print("Mini Intruder")
         print("-" * 70)
-        print(f"Target : {self.url}")
-        print(f"Method : {self.method}")
-        print(f"Payload: {self.parameter}")
-        print(f"Items  : {len(payloads)}")
+        print(f"Login URL      : {self.url}")
+        print(f"Form Action    : {self.form_action}")
+        print(f"Method         : {self.form_method}")
+        print(f"Username Field : {self.username_field}")
+        print(f"Password Field : {self.password_field}")
+        print(f"Target         : {self.target}")
+        print(f"Payloads       : {len(payloads)}")
+        print(f"Retries        : {self.retries}")
         print("-" * 70)
 
-        for number, payload in enumerate(payloads, start=1):
-
-            self.print_request_info(
-                number,
+        for number, payload in enumerate(
+            payloads,
+            start=1
+        ):
+            response = self.send_with_retry(
                 payload
             )
 
-            try:
+            if response is None:
+                continue
 
-                response = self.send_request(payload)
-
-                fingerprint = self.fingerprint(
-                    response
-                )
-
-                if self.baseline is None:
-                    self.baseline = fingerprint
-
-                different = self.is_different(
-                    fingerprint
-                )
-
-                self.print_response(
-                    response,
-                    fingerprint,
-                    different
-                )
-
-            except requests.RequestException as error:
-
-                print()
-                print(f"Request failed: {error}")
+            self.analyze_response(
+                payload,
+                response,
+                number
+            )
 
 
-def parse_arguments():
-
+def main():
     parser = argparse.ArgumentParser(
-        description="Educational Mini Burp Intruder"
+        description="Educational Mini Intruder"
     )
 
     parser.add_argument(
         "-u",
         "--url",
-        required=True,
-        help="Target URL"
+        required=True
     )
 
     parser.add_argument(
         "-w",
         "--wordlist",
+        required=True
+    )
+
+    parser.add_argument(
+        "--target",
         required=True,
-        help="Username wordlist"
+        choices=[
+            "username",
+            "password"
+        ]
     )
 
     parser.add_argument(
-        "-m",
-        "--method",
-        default="GET",
-        choices=["GET", "POST"],
-        help="HTTP method"
+        "--fixed",
+        required=True
     )
 
     parser.add_argument(
-        "-p",
-        "--parameter",
-        default="username",
-        help="Parameter to fuzz"
+        "--retries",
+        type=int,
+        default=3
     )
 
     parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Show full response"
+        "--retry-delay",
+        type=float,
+        default=1
     )
 
-    return parser.parse_args()
-
-
-def main():
-
-    args = parse_arguments()
+    args = parser.parse_args()
 
     intruder = MiniIntruder(
         url=args.url,
-        method=args.method,
         wordlist=args.wordlist,
-        parameter=args.parameter,
-        verbose=args.verbose
+        fixed_value=args.fixed,
+        target=args.target,
+        retries=args.retries,
+        retry_delay=args.retry_delay
     )
 
-    intruder.run()
+    try:
+        intruder.run()
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+    except Exception as error:
+        print(f"[!] Error: {error}")
 
 
 if __name__ == "__main__":
